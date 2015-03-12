@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2014 SUSE LINUX Products GmbH
  * Copyright (c) 2015 SUSE Linux GmbH
+ * Copyright (c) 2015 Adapteva Inc.
  *
  * Derived from zynq-zed.dts:
  *
@@ -30,7 +31,17 @@
 
 	memory {
 		device_type = "memory";
-		reg = <0x0 0x40000000>;
+		reg = <0x0 0x3e000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+		no-map;
+		emem: emem@3e00000 {
+			reg = <0x3e000000 0x2000000>;
+		};
 	};
 
 	chosen {
@@ -67,10 +78,79 @@
 };
 
 &fpga {
-	epiphany@808f0f00 {
-		compatible = "adapteva,parallella-fpgaconf";
-		reg = <0x808f0f00 0x18>;
+	epiphany: epiphany {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		compatible = "adapteva,epiphany";
 		/*clocks = <&>;*/
+
+		memory-region = <&emem>;
+
+		/* Refers FPGA elink interface(s), perhaps we need a better
+		 * name, bridge?
+		 */
+		adapteva,elinks = <&elink0>;
+
+		/* physical eLink connections between arrays.
+		 * connections within array must follow predefined pattern.
+		 * <phandle1, relative coreid1, phandle2, coreid2, [...]>
+		 * need phandles since FPGA does not have any cores = no coreid
+		 */
+		adapteva,connections = <&elink0 0 &array0 0x8b>;
+
+		/* This might be better */
+		/*adapteva,connections = <&elink0 "west">, <&array0 "east">;*/
+		/* or */
+		/*adapteva,connections = <&elink0 EPIPHANY_WEST &array0 EPIPHANY_EAST>;*/
+	};
+};
+
+&epiphany {
+	elink0: elink0@70000000 {
+		reg = <0x70000000 0x1000>;
+
+		/* coreid pin-out register(s) configuration. */
+		adapteva,coreids = <0x808>;
+
+
+		/* Initial FPGA elink MMU config. This is hardcoded in the FPGA
+		 * code now.
+		 * Not sure if we actually need it here. Driver needs to probe
+		 * bitstream version to check whether it is supported or not
+		 * anyways. And if not this is the only mapping we will allow */
+		/*adapteva,mmu = <0x8e000000 0x3e000000 0x02000000>;*/
+
+	};
+
+	emesh: epiphany-mesh {
+		#address-cells = <1>; /* <north-west core's id> */
+		#size-cells = <2>; /* <#chip rows, #chip cols> */
+
+		/* Host address range (including empty space) */
+		reg = <0x80000000 0x40000000>;
+
+		/* Use chip-arrays instead having one dt entry per chip
+		 * (e.g., a Epiphany-III array w/ 1024 cores would require 64
+		 * dt entries), with this approach we just need one.
+		 */
+		array0: array0@808 {
+			/* <north-west coreid, #chip rows, #chip cols> */
+			reg = <0x808 1 1>;
+			/* Must be uniform */
+			adapteva,chip-model = "epiphany3";
+
+			/* Optional per chip dims Rows cols, uniform */
+			/* adapteva,chip-dims = <4 4>; */
+
+			/* Power / thermal control. Will not implement much for now but
+			 * will read supply voltage to check if we can run chip elink
+			 * TX at full speed. Can be a list. */
+			ecore-supply = <&regulator_epiphany>;
+			/*io-channels = <&adc 0>;*/
+			/*io-channel-names = "zynq_temp";*/
+		};
 	};
 };
 
@@ -104,7 +184,7 @@
 		reg = <0x68>;
 
 		regulators {
-			dcd1 {
+			regulator_epiphany: dcd1 {
 				regulator-name = "VDD_DSP";
 				regulator-always-on;
 			};
@@ -329,4 +409,15 @@
 	usb-phy = <&usb_phy1>;
 	pinctrl-names = "default";
 	pinctrl-0 = <&pinctrl_usb1_default>;
+};
+
+&adc {
+	xlnx,channels {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		channel@0 {
+			#io-channel-cells = <0>;
+			reg = <0>;
+		};
+	};
 };
