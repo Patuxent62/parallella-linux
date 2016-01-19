@@ -7,6 +7,8 @@
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/gfp.h>
+#include <linux/interrupt.h>
+#include <linux/wait.h>
 #include <asm/uaccess.h>
 
 #include <linux/epiphany.h>
@@ -23,6 +25,20 @@ MODULE_LICENSE("GPL");
 #define EPIPHANY_MEM_START      0x80800000UL
 #define EPIPHANY_MEM_END        0xC0000000UL
 
+/* FPGA elink register base
+ * TODO: Define in device tree */
+#define ELINK_REGS_BASE		0x81000000UL
+#define ELINK_REGS_SIZE		0x00100000UL
+
+#define ELINK_RXCFG		0xF0300UL
+#define ELINK_MAILBOXLO		0xF0730UL
+#define ELINK_MAILBOXHI		0xF0734UL
+#define ELINK_MAILBOXSTAT	0xF0738UL
+
+/* FPGA elink IRQ NR
+ * TODO: Define in device tree */
+#define EPIPHANY_MAILBOX_IRQ_NR	87 /* 55 + 32 */
+
 /* The physical address of the DRAM shared between the host and Epiphany */
 #define HOST_MEM_START          0x3E000000UL
 #define HOST_MEM_END            0x40000000UL
@@ -32,6 +48,11 @@ MODULE_LICENSE("GPL");
 #define PL_MEM_START            0x40000000UL
 #define PL_MEM_END              0x80000000UL
 
+/* One mutex will do it for now */
+static DEFINE_MUTEX(epiphany_mutex);
+
+static DECLARE_WAIT_QUEUE_HEAD(epiphany_mailbox_wq);
+
 /* Function prototypes */
 static int epiphany_init(void);
 static void epiphany_exit(void);
@@ -39,6 +60,7 @@ static int epiphany_open(struct inode *, struct file *);
 static int epiphany_release(struct inode *, struct file *);
 static int epiphany_mmap(struct file *, struct vm_area_struct *);
 static long epiphany_ioctl(struct file *, unsigned int, unsigned long);
+static irqreturn_t epiphany_mailbox_irq_handler(int, void *);
 
 static struct file_operations epiphany_fops = {
 	.owner = THIS_MODULE,
@@ -54,6 +76,32 @@ static struct cdev *epiphany_cdev = 0;
 static struct class *class_epiphany = 0;
 static struct device *dev_epiphany = 0;
 static epiphany_alloc_t global_shm;
+
+static void __iomem *elink_regs;
+
+
+union elink_rxcfg {
+	u32 reg;
+	struct {
+		unsigned test_mode:1;
+		unsigned mmu_enable:1;
+		unsigned remap_mode:2;
+		unsigned remap_sel:12;
+		unsigned remap_pattern:12;
+		unsigned mailbox_irq_enable:1;
+	};
+} __packed;
+
+union elink_mailboxstat {
+	u32 reg;
+	struct {
+		unsigned not_empty:1;
+		unsigned full:1;
+		unsigned half_full:1;
+		unsigned:13;
+		u16 count;
+	};
+} __packed;
 
 static int epiphany_init(void)
 {
@@ -89,6 +137,26 @@ static int epiphany_init(void)
 	if (IS_ERR(ptr_err = dev_epiphany)) {
 		goto err;
 	}
+
+	elink_regs = ioremap_nocache(ELINK_REGS_BASE, ELINK_REGS_SIZE);
+	if (!elink_regs) {
+		printk(KERN_ERR "epiphany_init(): cannot map elink regs\n");
+
+		ptr_err = ERR_PTR(-EIO);
+		goto err;
+	}
+
+	if (request_irq(EPIPHANY_MAILBOX_IRQ_NR, epiphany_mailbox_irq_handler,
+			IRQF_TRIGGER_RISING, "epiphany-mailbox",
+			dev_epiphany)) {
+		printk(KERN_ERR "epiphany_init(): cannot register IRQ %d\n",
+		       EPIPHANY_MAILBOX_IRQ_NR);
+
+		ptr_err = ERR_PTR(-EIO);
+		goto err;
+	}
+
+
 #if UseReservedMem
 	/* 
 	 ** Use the system reserved memory until we have a way
@@ -143,6 +211,7 @@ static void epiphany_exit(void)
 #if (UseReservedMem == 0)
 	free_pages(global_shm.kvirt_addr, get_order(global_shm.size));
 #endif
+	free_irq(EPIPHANY_MAILBOX_IRQ_NR, dev_epiphany);
 	device_destroy(class_epiphany, MKDEV(major, 0));
 	class_destroy(class_epiphany);
 	cdev_del(epiphany_cdev);
@@ -238,6 +307,123 @@ static int epiphany_mmap(struct file *file, struct vm_area_struct *vma)
 	return retval;
 }
 
+static inline void reg_write(unsigned long reg, u32 val)
+{
+	iowrite32(val, (u8 __iomem *)elink_regs + reg);
+}
+
+static inline u32 reg_read(unsigned long reg)
+{
+	return ioread32((u8 __iomem *)elink_regs + reg);
+}
+
+static void epiphany_mailbox_irq_enable(void)
+{
+	union elink_rxcfg cfg;
+
+	cfg.reg = reg_read(ELINK_RXCFG);
+	cfg.mailbox_irq_enable = 1;
+	reg_write(ELINK_RXCFG, cfg.reg);
+}
+
+static void epiphany_mailbox_irq_disable(void)
+{
+	union elink_rxcfg cfg;
+
+	cfg.reg = reg_read(ELINK_RXCFG);
+	cfg.mailbox_irq_enable = 0;
+	reg_write(ELINK_RXCFG, cfg.reg);
+}
+
+static bool epiphany_mailbox_empty_p(void)
+{
+	union elink_mailboxstat status;
+
+	status.reg = reg_read(ELINK_MAILBOXSTAT);
+
+	return !status.not_empty;
+}
+
+static long epiphany_ioc_mailbox_read(struct file *file, void __user *dst)
+{
+	struct epiphany_mailbox_msg msg;
+
+	if (mutex_lock_interruptible(&epiphany_mutex))
+		return -ERESTARTSYS;
+
+	while (epiphany_mailbox_empty_p()) {
+		mutex_unlock(&epiphany_mutex);
+
+		if (file->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+
+		if (mutex_lock_interruptible(&epiphany_mutex))
+			return -ERESTARTSYS;
+
+		epiphany_mailbox_irq_enable();
+
+		mutex_unlock(&epiphany_mutex);
+
+		if (wait_event_interruptible(epiphany_mailbox_wq,
+					     !epiphany_mailbox_empty_p()))
+			return -ERESTARTSYS;
+
+		if (mutex_lock_interruptible(&epiphany_mutex))
+			return -ERESTARTSYS;
+	}
+
+	msg.from = reg_read(ELINK_MAILBOXLO);
+	msg.data = reg_read(ELINK_MAILBOXHI);
+
+	mutex_unlock(&epiphany_mutex);
+
+	if (copy_to_user(dst, &msg, sizeof(msg)))
+		return -EACCES;
+
+	return 0;
+}
+
+static unsigned epiphany_mailbox_count(void)
+{
+	union elink_mailboxstat status;
+
+	status.reg = reg_read(ELINK_MAILBOXSTAT);
+
+	return status.count;
+}
+
+static long epiphany_ioc_mailbox_count(struct file *file)
+{
+	long count;
+
+	if (mutex_lock_interruptible(&epiphany_mutex))
+		return -ERESTARTSYS;
+
+	count = epiphany_mailbox_count();
+
+	mutex_unlock(&epiphany_mutex);
+
+	return count;
+}
+
+static irqreturn_t epiphany_mailbox_irq_handler(int irq, void *dev_id)
+{
+	bool empty;
+
+	(void) dev_id;
+
+	mutex_lock(&epiphany_mutex);
+	empty = epiphany_mailbox_empty_p();
+	if (!empty)
+		epiphany_mailbox_irq_disable();
+	mutex_unlock(&epiphany_mutex);
+
+	if (!empty)
+		wake_up(&epiphany_mailbox_wq);
+
+	return empty ? IRQ_NONE : IRQ_HANDLED;
+}
+
 static long epiphany_ioctl(struct file *file, unsigned int cmd,
 			   unsigned long arg)
 {
@@ -274,6 +460,14 @@ static long epiphany_ioctl(struct file *file, unsigned int cmd,
 			retval = -EACCES;
 		}
 
+		break;
+
+	case EPIPHANY_IOC_MAILBOX_READ:
+		retval = epiphany_ioc_mailbox_read(file, (void __user *) arg);
+		break;
+
+	case EPIPHANY_IOC_MAILBOX_COUNT:
+		retval = epiphany_ioc_mailbox_count(file);
 		break;
 
 	default:		/* Redundant, cmd was checked against MAXNR */
