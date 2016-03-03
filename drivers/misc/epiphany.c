@@ -30,6 +30,7 @@
 #include <linux/cdev.h>
 #include <linux/interrupt.h>
 #include <linux/wait.h>
+#include <linux/dma-mapping.h>
 
 #include "epiphany.h"
 
@@ -38,12 +39,16 @@
 #define E_DEV_NUM_MINORS	MINORMASK	/* Total to reserve */
 
 #define COREID_SHIFT 20
-#define COREID_MASK ((1 << COREID_SHIFT) - 1)
+#define COREID_MASK ((1ULL << COREID_SHIFT) - 1ULL)
 
 /* Be careful, no range check */
 #define COORDS(row, col) ((row) * 64 | (col))
 #define ROW(coreid) ((coreid) / 64)
 #define COL(coreid) ((coreid) % 64)
+
+/* For generating error reports */
+static bool dump_mesh_packets = false;
+static u32 dump_mesh_packets_base;
 
 struct epiphany_vma_entry {
 	struct list_head	list;
@@ -272,6 +277,10 @@ struct elink_device {
 	struct work_struct mailbox_irq_work;
 	atomic_t mailbox_maybe_not_empty;
 
+	void *dummy_virt;
+	dma_addr_t dummy_bus;
+	unsigned long dummy_pfn;
+
 	phandle phandle;
 };
 
@@ -341,8 +350,68 @@ array_get_max_perf_state(const struct array_device *array)
 	return E_PS_LOWEST;
 }
 
+
+static void _dump_mesh(u32 wait_cycles,
+		       u32 ctrlmode_data_mode_write,
+		       u32 dstaddr_lo,
+		       u32 data_lo,
+		       u32 data_hi,
+		       u32 src_hi,
+		       u32 dstaddr_hi)
+{
+	if (!dump_mesh_packets)
+		return;
+
+#ifdef SIXTYFOURBITDUMPS
+	pr_err("pkt: %08x_%08x_%08x_%08x_%08x_%02x_%04x\n",
+	       dstaddr_hi,
+	       src_hi,
+	       data_hi,
+	       data_lo,
+	       dstaddr_lo,
+	       ctrlmode_data_mode_write,
+	       wait_cycles);
+#else
+	pr_err("pkt: %08x_%08x_%08x_%02x_%04x\n",
+	       data_hi,
+	       data_lo,
+	       dstaddr_lo,
+	       ctrlmode_data_mode_write,
+	       wait_cycles);
+#endif
+}
+
+static void dump_mesh_write32(u32 value, u32 offset)
+{
+	u32 dstaddr_lo = dump_mesh_packets_base + offset;
+
+	_dump_mesh(0, 5, dstaddr_lo, value, 0, 0, 0);
+
+}
+
+static void dump_mesh_read32(u32 offset)
+{
+	u32 dstaddr_lo = dump_mesh_packets_base + offset;
+	u32 srcaddr_lo = dump_mesh_packets_base + 0xd0000; /* read resp reg */
+
+	_dump_mesh(0, 4, dstaddr_lo, srcaddr_lo, 0, 0, 0);
+
+}
+
+static void dump_enable(struct elink_device *elink)
+{
+	dump_mesh_packets = true;
+	dump_mesh_packets_base = elink->regs_start;
+}
+
+static void dump_disable(void)
+{
+	dump_mesh_packets = false;
+}
+
 static inline void reg_write(u32 value, void __iomem *base, u32 offset)
 {
+	dump_mesh_write32(value, offset);
 	iowrite32(value, (u8 __iomem *)base + offset);
 }
 
@@ -354,6 +423,7 @@ static inline void reg_write64(u64 value, void __iomem *base, u32 offset)
 
 static inline u32 reg_read(void __iomem *base, u32 offset)
 {
+	dump_mesh_read32(offset);
 	return ioread32((u8 __iomem *)base + offset);
 }
 
@@ -666,10 +736,30 @@ static int configure_adjacent_links(struct elink_device *elink)
 
 static void elink_update_mmu_mappings(struct elink_device *elink)
 {
-	const u32 mmu_base = 0xe8000;
+	const u32 mmu_base = 0xe8000, mmu_end = 0xf0000;
+	u32 offs;
 	struct mem_region *mapping;
 	u32 mmu_entry;
 	u64 phys_addr;
+
+
+	dev_err(&elink->dev, "%s: enter\n", __func__);
+	/* Clear all RXMMU pte's to dummy region so a rouge access doesn't
+	 * bring down the system. */
+#if 1
+	dev_err(&elink->dev, "%s: Initializing MMU table to safe 1MB region\n", __func__);
+	for (offs = mmu_base; offs < mmu_end; offs += 8) {
+		//dev_err(&elink->dev, "%s: offs=%#x val=%#lx\n", __func__,
+		//	offs, elink->dummy_pfn >> (COREID_SHIFT - PAGE_SHIFT));
+		//reg_write64(elink->dummy_pfn >> (COREID_SHIFT - PAGE_SHIFT),
+		//	    elink->regs, offs);
+		reg_write(elink->dummy_pfn >> (COREID_SHIFT - PAGE_SHIFT),
+			  elink->regs, offs);
+		msleep(50);
+		reg_read(elink->regs, offs);
+		msleep(50);
+	}
+#endif
 
 	list_for_each_entry(mapping, &elink->mappings_list, list) {
 		mmu_entry = mmu_base + ((mapping->emesh_start >> 20) << 3);
@@ -687,6 +777,8 @@ static void elink_update_mmu_mappings(struct elink_device *elink)
 	 * addr) */
 	reg_write64(elink->regs_start >> 20, elink->regs,
 			mmu_base + (elink->regs_start >> (20 - 3)));
+
+	dev_err(&elink->dev, "%s: exit\n", __func__);
 }
 
 /* Reset the Epiphany platform */
@@ -701,19 +793,22 @@ static int elink_reset(struct elink_device *elink)
 	union elink_txcfg txcfg = {0};
 	union elink_rxcfg rxcfg = {0};
 
+	//dev_err(&elink->dev, "%s: enter\n", __func__);
+	//dump_enable(elink);
+
 	/* assert reset */
 	reset.tx_reset = 1;
 	reset.rx_reset = 1;
 	reg_write(reset.reg, elink->regs, ELINK_RESET);
 
-	usleep_range(500, 600);
+	usleep_range(10000, 10100);
 
 	/* de-assert reset */
 	reset.tx_reset = 0;
 	reset.rx_reset = 0;
 	reg_write(reset.reg, elink->regs, ELINK_RESET);
 
-	usleep_range(500, 600);
+	usleep_range(10000, 10100);
 
 	reg_write(elink->coreid_pinout, elink->regs, ELINK_CHIPID);
 
@@ -723,13 +818,27 @@ static int elink_reset(struct elink_device *elink)
 	txcfg.enable = 1;
 	reg_write(txcfg.reg, elink->regs, ELINK_TXCFG);
 
+	reg_write(rxcfg.reg, elink->regs, ELINK_RXCFG);
+
+#if 0
+	elink_update_mmu_mappings(elink);
+
 	rxcfg.mmu_enable = 1;
 	rxcfg.remap_mode = 0; /* no remapping, only mmu */
 	reg_write(rxcfg.reg, elink->regs, ELINK_RXCFG);
+#else
+       /* TODO: From configuration */
+	rxcfg.remap_mode = 1;
+	rxcfg.remap_sel = 0xfe0;
+	rxcfg.remap_pattern = 0x3e0;
+	reg_write(rxcfg.reg, elink->regs, ELINK_RXCFG);
 
-	elink_update_mmu_mappings(elink);
+#endif
 
 	ret = configure_adjacent_links(elink);
+
+	//dump_disable();
+	//dev_err(&elink->dev, "%s: exit\n", __func__);
 
 	return ret;
 }
@@ -2664,6 +2773,21 @@ static struct elink_device *elink_of_probe(struct platform_device *pdev)
 		return ERR_PTR(ret);
 	}
 
+	/* TODO: We only need one dummy region for all devices
+	 * TODO: This can go away when the FPGA MMU gets a valid bit */
+	if (dma_set_mask_and_coherent(&pdev->dev, ~COREID_MASK)) {
+		dev_err(&pdev->dev, "unable to set dma mask\n");
+		return ERR_PTR(-EIO);
+	}
+	elink->dummy_virt = dma_alloc_coherent(&pdev->dev, 1 << COREID_SHIFT,
+					       &elink->dummy_bus, GFP_KERNEL);
+	if (!elink->dummy_virt) {
+		dev_err(&pdev->dev, "unable to allocate dummy mem region\n");
+		return ERR_PTR(-EIO);
+	}
+	elink->dummy_pfn = dma_to_pfn(&pdev->dev, elink->dummy_bus);
+	dev_info(&pdev->dev, "dma at %#lx %#lx %#lx\n", (long) elink->dummy_virt, (long) elink->dummy_bus, (long) dma_to_pfn(&pdev->dev, elink->dummy_bus));
+
 	ret = elink_register(elink);
 	if (ret)
 		return ERR_PTR(ret);
@@ -2708,6 +2832,9 @@ static int elink_platform_remove(struct platform_device *pdev)
 	of_platform_depopulate(&pdev->dev);
 
 	elink_unregister(elink);
+
+	dma_free_coherent(&pdev->dev, (1 << COREID_SHIFT), elink->dummy_virt,
+			  elink->dummy_bus);
 
 	dev_dbg(&pdev->dev, "device removed\n");
 
