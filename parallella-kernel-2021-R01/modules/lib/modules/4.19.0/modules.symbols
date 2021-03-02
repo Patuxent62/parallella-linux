@@ -1,0 +1,14 @@
+# Aliases for symbols, used by symbol_request().
+alias symbol:devm_mathworks_ip_register mathworks_ip_common
+alias symbol:mw_stream_channels_probe mwipcore_dma_streaming
+alias symbol:mw_stream_channel_get_ops mwipcore_dma_streaming
+alias symbol:devm_mathworks_ip_of_init mathworks_ip_common
+alias symbol:mw_stream_iio_channels_probe mwipcore_iio_streaming
+alias symbol:lcd_device_register lcd
+alias symbol:mathworks_ip_common_fops mathworks_ip_common
+alias symbol:uio_event_notify uio
+alias symbol:lcd_device_unregister lcd
+alias symbol:__uio_register_device uio
+alias symbol:uio_unregister_device uio
+alias symbol:devm_lcd_device_register lcd
+alias symbol:devm_lcd_device_unregister lcd
